@@ -1,1 +1,92 @@
+function clear_market_at_t_simple(d::Dict{String,Any}; t=1, tax=0.0, rps = 0.0);
+    model = Model(optimizer_with_attributes(Ipopt.Optimizer, "print_level" => 0));
 
+    # Set market inputs
+    R = size(d["a"], 1);  # number of regions
+    U = size(d["mc"], 2); # number of plants
+    L = size(d["lines"], 1); # number of lines
+
+    p0 = d["a"] ./ d["b"] # auxiliary parameter to don't write everytime a/b
+
+    # define costs of carbon: all emissions are taxed uniformly
+    er_tax = d["er"]
+
+    # variables to solve for
+    @variable(model, price[1:R]);
+    @variable(model, demand[1:R]);
+    @variable(model, yflow[1:R-1]);  # swing node is CA. How much is being sent to CA (y < 0 implies that CA is exporting)
+    @variable(model, q[1:R, 1:U] >= 0);
+
+    # summary variables (function of variables to solve):
+    @variable(model, surplus);
+    @variable(model, totalcost);  # fuel cost
+    @variable(model, totalecost);  # taxed emissions costs
+    @variable(model, totale[1:R]); # total emissions
+    rps_actual = [
+        @NLexpression(model, rps_actual1, (d["qmr"][1, t]) / (sum(q[1, i] for i in 1:U) + (d["qmr"][1, t]))),
+        @NLexpression(model, rps_actual2, (d["qmr"][2, t]) / (sum(q[2, i] for i in 1:U) + (d["qmr"][2, t]))),
+        @NLexpression(model, rps_actual3, (d["qmr"][3, t]) / (sum(q[3, i] for i in 1:U) + (d["qmr"][3, t]))),
+        @NLexpression(model, rps_actual4, (d["qmr"][4, t]) / (sum(q[4, i] for i in 1:U) + (d["qmr"][4, t])))
+    ]
+
+    q_region = [
+        @NLexpression(model, q_region1, sum(q[1, i] for i in 1:U)),
+        @NLexpression(model, q_region2, sum(q[2, i] for i in 1:U)),
+        @NLexpression(model, q_region3, sum(q[3, i] for i in 1:U)),
+        @NLexpression(model, q_region4, sum(q[4, i] for i in 1:U))
+    ]
+
+    
+
+    # definition of objective function
+    @NLobjective(model, Max, surplus - totalcost - totalecost) # Max surplus --> triangle + rectangle
+
+    @constraint(model, surplus == sum(0.5 * (p0[r, t] + price[r]) * demand[r] for r in 1:R));
+    @constraint(model, totalcost == sum(q[r, i] * d["mc"][r, i] for r in 1:R, i in 1:U));
+    @constraint(model, totalecost == sum(q[r, i] * d["er"][r, i] * tax for r in 1:R, i in 1:U));
+    @constraint(model, [r=1:R], totale[r] == sum(q[r, i] * d["er"][r, i] for i in 1:U));
+
+    # definition demand
+    @constraint(model, [r=1:R], demand[r] == (d["a"][r, t] - d["b"][r, t] * price[r]));
+
+    # constraint quantities to 95% of name plate capacity
+    @constraint(model, [r=1:R, i=1:U], q[r, i] <= 0.95 * d["mw"][r, i] / 1000.0); # mw = capacity
+
+    # congestion constraint: we require a minimum generation for some units
+    @constraint(model, [r=1:R, i=1:U], q[r, i] >= d["cf"][r, i] * d["flag"][r, i] * d["mw"][r, i] / 1000.0); # cf=capacity factor (similar to the 0.95 above)
+    
+    # market clearing: demand = production in CA + renewables + imports (or - exports)
+    @constraint(model, demand[1] == sum(q[1, i] for i=1:U) + d["qmr"][1, t] + sum(yflow[z] for z in 1:R-1)); # Summing flows from each region, separate imports and export to do the losses
+    @constraint(model, [r=2:R], demand[r] + yflow[r-1] == sum(q[r, i] for i=1:U) + d["qmr"][r, t]); # Constraint for every region [r=1:R, i=1:U] No imports
+
+    # transmission line
+    @constraint(model, [l=1:L], sum(d["fct"][z, l] * yflow[z] for z in 1:R-1) <= d["lines"][l]); # Flow through the defined lines --> a certain share can flow through different lines
+    @constraint(model, [l=1:L], sum(d["fct"][z, l] * yflow[z] for z in 1:R-1) >= -d["lines"][l]); # See appendix --> no transmission flow --> we could add a transmission loss
+
+    # Renewable Portfolio Standard (RPS) Constraint
+    @constraint(model,[r=1:R], (d["qmr"][r, t])  >= rps * (sum(q[r, i] for i in 1:U)+(d["qmr"][r, t])))
+
+
+    optimize!(model)
+
+    status = @sprintf("%s", JuMP.termination_status(model))
+
+    if ((status == "LOCALLY_SOLVED") || (status == "ALMOST_LOCALLY_SOLVED"))
+        results = Dict("status" => status,
+                       "surplus" => JuMP.value.(surplus),
+                       "totalcost" => JuMP.value.(totalcost),
+                       "totalecost" => JuMP.value.(totalecost),
+                       "totale" => JuMP.value.(totale),
+                       "price" => JuMP.value.(price),
+                       "demand" => JuMP.value.(demand),
+                       "yflow" => JuMP.value.(yflow),
+                       "q" => JuMP.value.(q),
+                       "q_region" => JuMP.value.(q_region),
+                       "RPS Actual" => JuMP.value.(rps_actual),
+                       "qmr" => JuMP.value.(d["qmr"][:,t]));
+        return results
+    else
+        results = Dict("status" => status)
+        return results
+    end
+end
